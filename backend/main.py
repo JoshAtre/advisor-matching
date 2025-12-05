@@ -8,51 +8,41 @@ from sqlalchemy.orm import Session
 import models, schemas, auth, matching, database
 from database import engine
 
-# 1. Setup Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AdvisorMatch")
 
-# 2. Init DB
 models.Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Advisor Match MVP")
+app = FastAPI(title="Advisor Match V2")
 
-# 3. CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"], # Frontend URL
+    allow_origins=["http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- ROUTES ---
-
+# --- AUTH ROUTES ---
 @app.post("/token", response_model=schemas.Token)
-def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(database.get_db)):
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(database.get_db)):
     user = db.query(models.User).filter(models.User.email == form_data.username).first()
     if not user or not auth.verify_password(form_data.password, user.hashed_password):
         raise HTTPException(status_code=400, detail="Incorrect email or password")
-    
-    access_token = auth.create_access_token(data={"sub": user.email})
-    return {"access_token": access_token, "token_type": "bearer"}
+    return {"access_token": auth.create_access_token(data={"sub": user.email}), "token_type": "bearer"}
 
 @app.post("/signup", response_model=schemas.UserOut)
 def signup(user: schemas.UserCreate, db: Session = Depends(database.get_db)):
-    db_user = db.query(models.User).filter(models.User.email == user.email).first()
-    if db_user:
+    if db.query(models.User).filter(models.User.email == user.email).first():
         raise HTTPException(status_code=400, detail="Email already registered")
-    
     hashed_pw = auth.get_password_hash(user.password)
     new_user = models.User(email=user.email, hashed_password=hashed_pw, full_name=user.full_name)
     db.add(new_user)
     db.commit()
-    db.refresh(new_user)
-    logger.info(f"event=user_signup user_id={new_user.id}")
     return new_user
 
 @app.get("/me", response_model=schemas.UserOut)
-def read_users_me(current_user: models.User = Depends(auth.get_current_user)):
+def get_me(current_user: models.User = Depends(auth.get_current_user)):
     return current_user
 
 @app.put("/me/profile", response_model=schemas.UserOut)
@@ -63,53 +53,48 @@ def update_profile(profile: schemas.ProfileUpdate,
     current_user.goals = profile.goals
     current_user.preferred_style = profile.preferred_style
     db.commit()
-    db.refresh(current_user)
-    logger.info(f"event=onboarding_completed user_id={current_user.id}")
     return current_user
 
+# --- MATCHING ROUTES ---
 @app.get("/matches", response_model=List[schemas.MatchResult])
 def get_matches(current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(database.get_db)):
-    # Failure Handling: Missing Profile
     if not current_user.interests:
-        raise HTTPException(status_code=400, detail="Please complete your profile first.")
+        raise HTTPException(status_code=400, detail="Profile incomplete")
 
     advisors = db.query(models.Advisor).all()
-    if not advisors:
-        logger.warning("event=match_requested result=no_advisors_found")
-        return []
-
     results = []
-    user_text = f"{current_user.interests} {current_user.goals} {current_user.preferred_style}"
-
-    for advisor in advisors:
-        advisor_text = f"{advisor.research_areas} {advisor.mentoring_style} {advisor.bio}"
-        score, explanation = matching.generate_match(user_text, advisor_text)
-        
-        # Only return decent matches
-        if score > 0:
-            results.append({
-                "advisor": advisor,
-                "score": score,
-                "explanation": explanation
-            })
-
-    # Sort by score desc
-    results.sort(key=lambda x: x["score"], reverse=True)
     
-    logger.info(f"event=match_results_viewed user_id={current_user.id} count={len(results)}")
+    for advisor in advisors:
+        score, explanation = matching.generate_weighted_match(current_user, advisor)
+        if score > 5: # Filter out noise
+            results.append({"advisor": advisor, "score": score, "explanation": explanation})
+
+    results.sort(key=lambda x: x["score"], reverse=True)
     return results
 
-@app.post("/advisors/{advisor_id}/save")
-def save_advisor(advisor_id: int, current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(database.get_db)):
-    exists = db.query(models.SavedAdvisor).filter_by(user_id=current_user.id, advisor_id=advisor_id).first()
-    if not exists:
-        saved = models.SavedAdvisor(user_id=current_user.id, advisor_id=advisor_id)
-        db.add(saved)
-        db.commit()
-        logger.info(f"event=advisor_saved user_id={current_user.id} advisor_id={advisor_id}")
-    return {"status": "saved"}
+# --- REQUEST ROUTES (NEW) ---
+@app.post("/requests", response_model=schemas.RequestOut)
+def create_request(req: schemas.RequestCreate, 
+                  current_user: models.User = Depends(auth.get_current_user), 
+                  db: Session = Depends(database.get_db)):
+    # Check for duplicate
+    existing = db.query(models.MeetingRequest).filter_by(
+        student_id=current_user.id, advisor_id=req.advisor_id
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Request already sent to this advisor")
 
-@app.get("/saved", response_model=List[schemas.AdvisorOut])
-def get_saved_advisors(current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(database.get_db)):
-    saved = db.query(models.SavedAdvisor).filter(models.SavedAdvisor.user_id == current_user.id).all()
-    return [s.advisor for s in saved]
+    new_req = models.MeetingRequest(
+        student_id=current_user.id,
+        advisor_id=req.advisor_id,
+        message=req.message,
+        status="Pending"
+    )
+    db.add(new_req)
+    db.commit()
+    db.refresh(new_req)
+    return new_req
+
+@app.get("/requests", response_model=List[schemas.RequestOut])
+def get_my_requests(current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(database.get_db)):
+    return db.query(models.MeetingRequest).filter(models.MeetingRequest.student_id == current_user.id).all()
